@@ -5,16 +5,19 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/bemasher/sx1276"
-	"golang.org/x/xerrors"
+	"github.com/sirupsen/logrus"
 
 	influxdb2 "github.com/influxdata/influxdb-client-go"
 )
@@ -30,8 +33,6 @@ const (
 	vdiv = r2 / (r1 + r2)
 
 	dryrun = false
-
-	wdtPeriod = 2 * time.Minute
 )
 
 type ID byte
@@ -44,13 +45,13 @@ func (id ID) MarshalText() ([]byte, error) {
 
 func (id *ID) UnmarshalText(text []byte) error {
 	if hex.DecodedLen(len(text)) != 1 {
-		return xerrors.Errorf("invalid id length: %q\n", text)
+		return fmt.Errorf("invalid id length: %q\n", text)
 	}
 
 	hexBuf := make([]byte, hex.DecodedLen(len(text)))
 	_, err := hex.Decode(hexBuf, text)
 	if err != nil {
-		return xerrors.Errorf("hex.DecodeString: %w", err)
+		return fmt.Errorf("hex.DecodeString: %w", err)
 	}
 
 	*id = ID(hexBuf[0])
@@ -68,11 +69,11 @@ type Config map[ID]Device
 func (cfg *Config) Read(filename string) error {
 	cfgBytes, err := ioutil.ReadFile(filename)
 	if err != nil {
-		return xerrors.Errorf("ioutil.ReadFile: %w", err)
+		return fmt.Errorf("ioutil.ReadFile: %w", err)
 	}
 	err = json.Unmarshal(cfgBytes, cfg)
 	if err != nil {
-		return xerrors.Errorf("json.Decode: %w", err)
+		return fmt.Errorf("json.Decode: %w", err)
 	}
 
 	return nil
@@ -81,12 +82,12 @@ func (cfg *Config) Read(filename string) error {
 func (cfg Config) Write(filename string) error {
 	cfgBytes, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		return xerrors.Errorf("json.MarshalIndent: %w", err)
+		return fmt.Errorf("json.MarshalIndent: %w", err)
 	}
 
 	err = ioutil.WriteFile(filename, cfgBytes, 0600)
 	if err != nil {
-		return xerrors.Errorf("ioutil.WriteFile: %w", err)
+		return fmt.Errorf("ioutil.WriteFile: %w", err)
 	}
 
 	return nil
@@ -97,7 +98,7 @@ func (cfg *Config) Reload(filename string) error {
 	newCfg := Config{}
 	err := newCfg.Read(filename)
 	if err != nil {
-		return xerrors.Errorf("newCfg.Read: %w", err)
+		return fmt.Errorf("newCfg.Read: %w", err)
 	}
 
 	// Merge new config with current.
@@ -108,102 +109,120 @@ func (cfg *Config) Reload(filename string) error {
 	// Commit merged config to disk.
 	err = cfg.Write(filename)
 	if err != nil {
-		return xerrors.Errorf("cfg.Write: %w", err)
+		return fmt.Errorf("cfg.Write: %w", err)
 	}
 
 	return nil
 }
 
 var (
+	log        = logrus.New()
+	pathPrefix = filepath.Dir(os.Args[0]) + "\\"
+	funcPrefix = "github.com/bemasher/issue_log/"
+	trace      bool
+
 	deviceFilename string
 
 	hostname  string
-	username  string
-	password  string
-	database  string
+	org       string
+	token     string
+	bucket    string
 	measure   string
 	retention string
 )
 
 func init() {
-	log.SetFlags(log.Lshortfile | log.Lmicroseconds)
+	flag.BoolVar(&trace, "trace", false, "set log level to trace")
+	flag.Parse()
+
+	formatter := &logrus.TextFormatter{
+		ForceColors:     true,
+		TimestampFormat: "2006-01-02 15:04:05.999",
+		CallerPrettyfier: func(frame *runtime.Frame) (fn, file string) {
+			file = strings.TrimPrefix(
+				filepath.Base(frame.File),
+				pathPrefix,
+			)
+			function := strings.TrimPrefix(frame.Function, funcPrefix)
+
+			return function, fmt.Sprintf("%s:%d", file, frame.Line)
+		},
+	}
+	log.Formatter = formatter
+	log.SetReportCaller(true)
+
+	if trace {
+		log.SetLevel(logrus.TraceLevel)
+	}
 
 	var ok bool
 
 	if deviceFilename, ok = os.LookupEnv("DATMOS_DEVICES"); !ok {
 		log.Fatalln("required environment variable DATMOS_DEVICES undefined")
 	}
-	log.Printf("DATMOS_DEVICES=%q\n", deviceFilename)
+	log.Infof("DATMOS_DEVICES=%q\n", deviceFilename)
 
 	if hostname, ok = os.LookupEnv("DATMOS_HOSTNAME"); !ok {
 		log.Fatalln("required environment variable DATMOS_HOSTNAME undefined")
 	}
-	log.Printf("DATMOS_HOSTNAME=%q\n", hostname)
+	log.Infof("DATMOS_HOSTNAME=%q\n", hostname)
 
-	username = os.Getenv("DATMOS_USERNAME")
-	log.Printf("DATMOS_USERNAME=%q\n", username)
-
-	password = os.Getenv("DATMOS_PASSWORD")
-	log.Println("DATMOS_PASSWORD=************")
-
-	if database, ok = os.LookupEnv("DATMOS_DATABASE"); !ok {
-		database = "datmos"
+	if org, ok = os.LookupEnv("DATMOS_ORG"); !ok {
+		log.Fatalln("required environment variable DATMOS_ORG undefined")
 	}
-	log.Printf("DATMOS_DATABASE=%q\n", database)
+	log.Infof("DATMOS_ORG=%q\n", org)
 
-	retention, _ = os.LookupEnv("DATMOS_RETENTION")
-	log.Printf("DATMOS_RETENTION=%q\n", retention)
+	if token, ok = os.LookupEnv("DATMOS_TOKEN"); !ok {
+		log.Fatalln("required environment variable DATMOS_TOKEN undefined")
+	}
+	log.Infoln("DATMOS_TOKEN=********")
+
+	if bucket, ok = os.LookupEnv("DATMOS_BUCKET"); !ok {
+		bucket = "datmos"
+	}
+	log.Infof("DATMOS_BUCKET=%q\n", bucket)
 
 	if measure, ok = os.LookupEnv("DATMOS_MEASURE"); !ok {
 		retention = "environment"
 	}
-	log.Printf("DATMOS_MEASURE=%q\n", measure)
+	log.Infof("DATMOS_MEASURE=%q\n", measure)
 }
 
 func main() {
 	cfg := Config{}
 	err := cfg.Read(deviceFilename)
 	if os.IsNotExist(err) {
-		log.Printf("device file does not exist, will write one on exit")
+		log.Infoln("device file does not exist, will write one on exit")
 	}
 	if err != nil {
-		log.Fatalf("%+v\n", xerrors.Errorf("cfg.Read: %w", err))
+		log.Fatalf("%+v\n", fmt.Errorf("cfg.Read: %w", err))
 	}
 	defer func() {
 		// Save config on exit.
 		err := cfg.Write(deviceFilename)
 		if err != nil {
-			log.Fatalf("%+v\n", xerrors.Errorf("cfg.Write: %w", err))
+			log.Fatalf("%+v\n", fmt.Errorf("cfg.Write: %w", err))
 		}
 	}()
 
 	for id, dev := range cfg {
-		log.Printf("{ID:%02X Name:%q}\n", id, dev.Name)
-	}
-
-	token := ""
-	if username != "" {
-		token = username + ":" + password
+		log.Infof("{ID:%02X Name:%q}\n", id, dev.Name)
 	}
 
 	client := influxdb2.NewClient(hostname, token)
 	if err != nil {
-		log.Fatalf("%+v\n", xerrors.Errorf("influxdb2.NewClient: %w", err))
+		log.Fatalf("%+v\n", fmt.Errorf("influxdb2.NewClient: %w", err))
 	}
 	defer client.Close()
 
-	bucket := database
-	if retention != "" {
-		bucket += "/" + retention
-	}
-	influxWriter := client.WriteAPIBlocking("", bucket)
+	influxWriter := client.WriteAPIBlocking(org, bucket)
 
 	sig := make(chan os.Signal)
 	signal.Notify(sig, os.Interrupt, os.Kill)
 
 	sx, err := sx1276.NewSX1276()
 	if err != nil {
-		log.Fatalf("%+v\n", xerrors.Errorf("NewSX1276: %w", err))
+		log.Fatalf("%+v\n", fmt.Errorf("NewSX1276: %w", err))
 	}
 	defer sx.Close()
 
@@ -220,55 +239,38 @@ func main() {
 
 	sx.SetFreq(frf)
 
-	rxCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	pkts := sx.StartRX(rxCtx)
-	defer sx.SetMode(sx1276.LORA_OPMODE_SLEEP)
-
-	// Watch dog timer.
-	wdt := time.NewTimer(wdtPeriod)
-
 	sigCh := make(chan os.Signal)
 	signal.Notify(sigCh)
 
-	log.Println("listening...")
+	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	pkts := sx.StartRX(ctx)
+	defer func() {
+		sx.SetMode(sx1276.LORA_OPMODE_SLEEP)
+	}()
+
+	log.Infoln("listening...")
 
 	for {
 		select {
 		case sig := <-sigCh:
 			switch sig {
 			case syscall.SIGUSR1:
-				log.Println("reloading config...")
+				log.Infoln("reloading config...")
 				err = cfg.Reload(deviceFilename)
 				if err != nil {
-					log.Printf("%+v\n", xerrors.Errorf("cfg.Write: %w", err))
+					log.Infof("%+v\n", fmt.Errorf("cfg.Write: %w", err))
 				}
-			case syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL:
-				log.Printf("received signal: %+v\n", sig)
+			case syscall.SIGINT, syscall.SIGKILL, syscall.SIGTERM:
+				log.Infoln("interrupted...")
 				return
 			}
-		case <-rxCtx.Done():
-			log.Println("context cancelled...")
+		case <-ctx.Done():
+			log.Infoln("context cancelled...")
 			return
-		case <-wdt.C:
-			log.Println("wdt elapsed...")
-			cancel()
-			sx.SetMode(sx1276.LORA_OPMODE_SLEEP)
-
-			rxCtx, cancel = context.WithCancel(context.Background())
-			defer cancel()
-
-			pkts = sx.StartRX(rxCtx)
-			defer sx.SetMode(sx1276.LORA_OPMODE_SLEEP)
-
-			wdt.Reset(wdtPeriod)
 		case pkt := <-pkts:
-			if !wdt.Stop() {
-				<-wdt.C
-			}
-			wdt.Reset(wdtPeriod)
-
 			var (
 				id  ID
 				dev Device
@@ -279,7 +281,7 @@ func main() {
 			switch len(pkt) {
 			case 44:
 				id = ID(pkt[0])
-				log.Printf("ID:0x%02X calibrating...", id)
+				log.Infof("ID:0x%02X calibrating...", id)
 
 				dev = cfg[id]
 				dev.BME280.Cal(pkt[1:])
@@ -293,11 +295,11 @@ func main() {
 				var ok bool
 
 				if dev, ok = cfg[id]; !ok {
-					log.Printf("ID:0x%02X not calibrated\n", id)
+					log.Warnf("ID:0x%02X not calibrated\n", id)
 					continue
 				}
 			default:
-				log.Printf("Unhandled Length (%2d): %02X\n", len(pkt), pkt)
+				log.Warnf("Unhandled Length (%2d): %02X\n", len(pkt), pkt)
 				continue
 			}
 
@@ -315,7 +317,7 @@ func main() {
 				name = dev.Name
 			}
 
-			log.Printf(
+			log.Tracef(
 				"ID:0x%02X Name:%q T:%0.1fF H:%0.1f%% P:%0.1fhPa V:%0.3fV\n",
 				id, name,
 				dev.BME280.temperature,
@@ -341,7 +343,7 @@ func main() {
 				t,
 			)
 			if err != nil {
-				log.Printf("%+v\n", xerrors.Errorf("influxdb2.NewPoint: %w", err))
+				log.Warnf("%+v\n", fmt.Errorf("influxdb2.NewPoint: %w", err))
 				continue
 			}
 
@@ -351,7 +353,7 @@ func main() {
 
 			err := influxWriter.WritePoint(context.Background(), pt)
 			if err != nil {
-				log.Printf("%+v\n", xerrors.Errorf("influxWriter.WritePoint: %w", err))
+				log.Warnf("%+v\n", fmt.Errorf("influxWriter.WritePoint: %w", err))
 				continue
 			}
 		}
